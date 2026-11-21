@@ -1,0 +1,51 @@
+# Tester-env overlay: upstream docker-compose.yml with the app built from local
+# source (image supplied by tester-env build), one Postgres 15.5 (digest-pinned)
+# and no separate migrate/task-processor services: `migrate-and-serve` runs the
+# migrations in the app container and TASK_RUN_METHOD=SEPARATE_THREAD keeps async
+# work in-process.
+services:
+  postgres:
+    image: postgres:15.5-alpine@sha256:934be6ae0a5bce0f607a5edc437e6bd606c074e595c28d4897845d6502823104
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: flagsmith
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d flagsmith -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+
+  app:
+    image: ${IMAGE_NAME}
+    restart: unless-stopped
+    ports:
+      - "${PORT}:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/flagsmith
+      USE_POSTGRES_FOR_ANALYTICS: "true"
+      ENVIRONMENT: production
+      DJANGO_ALLOWED_HOSTS: "*"
+      FLAGSMITH_DOMAIN: ${FLAGSMITH_DOMAIN}
+      DJANGO_SECRET_KEY: tester-env-flagsmith-not-for-production
+      WAREHOUSE_CREDENTIALS_SECRET: tester-env-flagsmith-not-for-production
+      TASK_RUN_METHOD: SEPARATE_THREAD
+      ENABLE_FE_E2E: "true"
+      E2E_TEST_AUTH_TOKEN: ${E2E_TEST_AUTH_TOKEN}
+      ENABLE_AXES: "false"
+      COOKIE_AUTH_ENABLED: "false"
+      USE_SECURE_COOKIES: "false"
+      # The SPA boots its own flags through the self-hosted flagsmith client;
+      # point it at this instance (relative path so it follows whatever origin
+      # the page is served from) instead of edge.api.flagsmith.com, so the UI
+      # never blocks on — or changes with — the public cloud project.
+      FLAGSMITH_ON_FLAGSMITH_API_URL: ${FLAGSMITH_ON_FLAGSMITH_API_URL:-/api/v1/}
+      FLAGSMITH_ON_FLAGSMITH_API_KEY: ${FLAGSMITH_ON_FLAGSMITH_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

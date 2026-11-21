@@ -1,0 +1,76 @@
+# Tester-env build of upstream's `oss-unified` target (single container: Django API + SPA).
+# Mirrors Dockerfile stages node/build-node/build-node-django/wolfi-base/build-python/
+# api-runtime/oss-unified, with base images pinned to digests and nothing else changed.
+# Dependency installs stay in their own stages (uv sync keyed on pyproject/uv.lock,
+# npm ci keyed on package.json/package-lock.json) so a mutation of api/ or frontend/
+# source only reruns the copy + bundle layers.
+ARG CI_COMMIT_SHA=dev
+ARG NODE_VERSION=24
+ARG PYTHON_VERSION=3.13
+
+FROM node:24-bookworm@sha256:9d266751ca3d7fdbe651c878ffd5ad0a42fed49a18c283509267c97f025b7496 AS node
+FROM cgr.dev/chainguard/wolfi-base@sha256:be019c1c74fe69204a42c4e10bc4d886a49bf5403ffa74374ef7baa408fc9a26 AS wolfi-base
+
+FROM node AS build-node
+WORKDIR /build
+COPY frontend/package.json frontend/package-lock.json frontend/.npmrc frontend/.nvmrc ./frontend/
+COPY frontend/bin/ ./frontend/bin/
+COPY frontend/env/ ./frontend/env/
+ARG ENV=selfhosted
+RUN cd frontend && ENV=${ENV} npm ci --quiet --production
+
+COPY frontend /build/frontend
+
+FROM build-node AS build-node-django
+# npm run bundledjango is the slow (rspack production) step: it reruns on every
+# frontend/ source change, never on api/ changes.
+RUN mkdir /build/api && cd frontend && npm run bundledjango
+
+FROM wolfi-base AS build-python
+COPY --from=ghcr.io/astral-sh/uv@sha256:d3b601f0c7b118bc1753febf7c41cc80981df678445e0254284eecf84db79a7d /uv /uvx /bin/
+WORKDIR /build
+ARG PYTHON_VERSION
+RUN apk add build-base linux-headers curl git \
+  python-${PYTHON_VERSION} \
+  python-${PYTHON_VERSION}-dev \
+  py${PYTHON_VERSION}-pip
+COPY api/pyproject.toml api/uv.lock api/Makefile ./
+ENV UV_PROJECT_ENVIRONMENT=/build/.venv \
+  UV_PYTHON_PREFERENCE=only-system \
+  UV_PYTHON=python${PYTHON_VERSION} \
+  UV_LINK_MODE=copy \
+  UV_NO_SYNC=1 \
+  UV_CACHE_DIR=/root/.cache/uv
+RUN --mount=type=cache,target=/root/.cache/uv \
+  make install opts='--no-install-project'
+
+FROM wolfi-base AS api-runtime
+ARG PYTHON_VERSION
+RUN apk add python-${PYTHON_VERSION} && \
+  mkdir /build/ && ln -s /usr/local/ /build/.venv
+WORKDIR /app
+COPY api /app/
+COPY .release-please-manifest.json /app/.versions.json
+ARG PROMETHEUS_MULTIPROC_DIR="/tmp/prometheus"
+ARG ACCESS_LOG_LOCATION="/dev/null"
+ENV ACCESS_LOG_LOCATION=${ACCESS_LOG_LOCATION} \
+  PROMETHEUS_MULTIPROC_DIR=${PROMETHEUS_MULTIPROC_DIR} \
+  DJANGO_SETTINGS_MODULE=app.settings.production \
+  GUNICORN_WORKERS=3 \
+  GUNICORN_THREADS=2 \
+  APPLICATION_LOGGERS="api_usage,app_analytics,audit,code_references,common,core,dynamodb,edge_api,environments,features,import_export,integrations,mcp,oauth2_metadata,organisations,projects,segment_membership,segments,task_processor,trust_relationships,users,webhooks,workflows"
+ARG CI_COMMIT_SHA
+RUN echo ${CI_COMMIT_SHA} > /app/CI_COMMIT_SHA && \
+  mkdir -p ${PROMETHEUS_MULTIPROC_DIR} && \
+  chmod 01777 ${PROMETHEUS_MULTIPROC_DIR}
+EXPOSE 8000
+ENTRYPOINT ["flagsmith"]
+CMD ["migrate-and-serve"]
+HEALTHCHECK --interval=2s --timeout=2s --retries=3 --start-period=20s \
+  CMD flagsmith healthcheck tcp
+
+FROM api-runtime AS oss-unified
+COPY --from=build-python /build/.venv/ /usr/local/
+COPY --from=build-node-django /build/api/ /app/
+RUN python manage.py collectstatic --no-input
+USER nobody

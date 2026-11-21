@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "app": "flagsmith",
+  "credentials": "e2e_user@flagsmithe2etestdomain.io / Str0ngp4ssw0rd!",
+  "seed_command": "./tester-env seed",
+  "verify_command": "./tester-env verify",
+  "notes": "Seed = upstream e2e teardown/reseed (org 'Bullet Train Ltd', 7 projects, 8 users, enterprise plan) plus tester-env-seed.py, which adds the product baseline to 'My Test Project'. The teardown deletes the whole e2e organisation, so every seed run starts from the same state and any browser-created leftovers (e.g. the earlier feature browser_smoke_check) are gone. IDs are database-generated and must not be asserted; match by name, count, value, status and pinned date.",
+  "requirements": {
+    "project-with-feature-inventory": {
+      "status": "present",
+      "evidence": "Project 'My Test Project' (Development + Production) holds exactly 8 features: checkout_v2, seat_map_enabled, max_seats_per_booking, loyalty_points_multiplier, checkout_copy_variant, journey_planner_config, delay_notification_threshold_minutes, duty_free_catalogue. No other project has features."
+    },
+    "varied-feature-value-types": {
+      "status": "present",
+      "evidence": "Boolean (checkout_v2 true, seat_map_enabled true), integer (max_seats_per_booking 6 Dev / 4 Prod, loyalty_points_multiplier 2, delay_notification_threshold_minutes 10), string (checkout_copy_variant 'one-tap' / 'control') and JSON string values (journey_planner_config {\"max_connections\": 2, \"prefer_rail\": true}, duty_free_catalogue {\"enabled_categories\": []})."
+    },
+    "feature-enabled-state-mix": {
+      "status": "present",
+      "evidence": "Development: 7 enabled / 1 disabled (duty_free_catalogue off). Production: 3 enabled (seat_map_enabled, max_seats_per_booking, delay_notification_threshold_minutes) / 5 disabled (checkout_v2, loyalty_points_multiplier, checkout_copy_variant, journey_planner_config, duty_free_catalogue). Values differ per environment, e.g. max_seats_per_booking 6 vs 4."
+    },
+    "feature-tag-filtering": {
+      "status": "present",
+      "evidence": "Exactly 4 project tags: checkout (#1F7A8C), experiment (#00B894), mobile (#6C5CE7), pricing (#E17055). Feature counts: checkout 3, experiment 3, mobile 3, pricing 2, plus duty_free_catalogue deliberately untagged for the empty-tag filter."
+    },
+    "feature-list-search": {
+      "status": "present",
+      "evidence": "Distinct searchable names: search 'checkout' matches checkout_v2 and checkout_copy_variant; 'seat_map' matches seat_map_enabled; 'loyalty' matches loyalty_points_multiplier."
+    },
+    "feature-created-date-sort": {
+      "status": "present",
+      "evidence": "created_date pinned (UTC): checkout_v2 2026-09-14 09:30, seat_map_enabled 2026-09-21 14:05, max_seats_per_booking 2026-10-02 11:15, loyalty_points_multiplier 2026-10-09 08:45, checkout_copy_variant 2026-10-16 16:20, journey_planner_config 2026-10-23 10:10, delay_notification_threshold_minutes 2026-11-03 13:40, duty_free_catalogue 2026-11-10 09:05."
+    },
+    "project-segments-with-rules": {
+      "status": "present",
+      "evidence": "Project-level segments 'Loyalty Members' (root ALL -> ALL rule group: plan EQUAL gold) and 'UK Frequent Travellers' (root ALL -> ALL rule group: country EQUAL GB, bookings GREATER_THAN_INCLUSIVE 5). The tree matches what the UI's own POST /projects/{id}/segments/ creates: the root rule holds no conditions, conditions live on the nested ALL/ANY/NONE rule group, which is where the segment editor reads them. Rules and conditions are stored in both SegmentRule/Condition rows and the segment rules_data JSON."
+    },
+    "identities-with-traits": {
+      "status": "present",
+      "evidence": "Development identities: identity-1042 (plan=gold, country=GB, bookings=12, newsletter=true), identity-2087 (plan=silver, country=US, bookings=2, newsletter=false), identity-3311 (plan=gold, country=IE, bookings=6). identity-1042 is in both segments, identity-3311 only in Loyalty Members; identity created_date pinned to 2026-10-05 08:00 UTC."
+    },
+    "spa-bootstrap-environment": {
+      "status": "present",
+      "evidence": "Deploy creates 'Tester Env Platform / Platform Configuration / Default' with fixed key testerenvplatformflags0000000001 so the SPA reads its own flags from /api/v1/ and never renders Maintenance."
+    },
+    "baseline-without-smoke-artifacts": {
+      "status": "present",
+      "evidence": "Seed starts with POST /api/v1/e2etests/teardown/, which deletes the e2e users' organisations, so the leftover feature browser_smoke_check (created during browser smoke) is removed; ./tester-env verify fails if it reappears."
+    }
+  }
+}

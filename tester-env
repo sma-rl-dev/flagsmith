@@ -1,0 +1,445 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Flagsmith - Tester Environment CLI
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, reset, stop, logs, status, help
+#
+# Build is from editable source: Dockerfile.tester-env in this directory mirrors
+# upstream's `oss-unified` target (Django API + bundled SPA on :8000) with pinned
+# base images. Postgres 15.5 comes from docker-compose.tester-env.yml; migrations
+# run in the app container (`migrate-and-serve`) and async work uses
+# TASK_RUN_METHOD=SEPARATE_THREAD, so there is no task-processor service.
+#
+# Determinism: ENABLE_FE_E2E + a fixed E2E_TEST_AUTH_TOKEN expose
+# POST /api/v1/e2etests/teardown/, which reseeds org "Bullet Train Ltd" and the
+# e2e users (all share the password below). Disabling django-axes keeps repeated
+# negative-login attempts from locking the account out.
+
+RUN_ID="${RUN_ID:-default}"
+PORT="${PORT:-18097}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TESTER_ENV_PROJECT="${TESTER_ENV_PROJECT:-tester-env}"
+TESTER_ENV_APP="${TESTER_ENV_APP:-flagsmith}"
+TESTER_ENV_SCENARIO="${TESTER_ENV_SCENARIO:-manual}"
+
+# IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+# (baseline, patch-set) combos share an image. Manual invocations get :dev.
+IMAGE_NAME="${IMAGE_TAG:-tester-env-flagsmith:dev}"
+E2E_TEST_AUTH_TOKEN="${E2E_TEST_AUTH_TOKEN:-tester-env-e2e-token}"
+# Client API key of the environment the SPA reads its own flags from
+# (tester-env-bootstrap.py creates it with this exact key).
+FLAGSMITH_ON_FLAGSMITH_API_KEY="${FLAGSMITH_ON_FLAGSMITH_API_KEY:-testerenvplatformflags0000000001}"
+
+E2E_USER="e2e_user@flagsmithe2etestdomain.io"
+E2E_PASSWORD="Str0ngp4ssw0rd!"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+    PROJECT="tester-env-flagsmith${suffix}"
+    # The SPA reads its own flags from FLAGSMITH_ON_FLAGSMITH_API_URL, which the
+    # compose overlay defaults to the relative "/api/v1/" so the request follows
+    # whatever origin serves the page (localhost or the browser container's
+    # host.docker.internal). No absolute origin needs computing here.
+    FLAGSMITH_DOMAIN="${FLAGSMITH_DOMAIN:-localhost:${PORT}}"
+}
+
+compose() {
+    IMAGE_NAME="${IMAGE_NAME}" \
+    PORT="${PORT}" \
+    E2E_TEST_AUTH_TOKEN="${E2E_TEST_AUTH_TOKEN}" \
+    FLAGSMITH_ON_FLAGSMITH_API_URL="${FLAGSMITH_ON_FLAGSMITH_API_URL:-}" \
+    FLAGSMITH_ON_FLAGSMITH_API_KEY="${FLAGSMITH_ON_FLAGSMITH_API_KEY}" \
+    FLAGSMITH_DOMAIN="${FLAGSMITH_DOMAIN}" \
+    docker compose -p "${PROJECT}" -f "${SCRIPT_DIR}/docker-compose.tester-env.yml" "$@"
+}
+
+wait_http() {
+    local url="$1" i
+    for i in $(seq 1 90); do
+        if curl -fs "${url}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "ERROR: ${url} did not respond in time."
+    compose logs --tail 40 app || true
+    return 1
+}
+
+cmd_deploy() {
+    echo "==> Building image ${IMAGE_NAME} from source..."
+    local started
+    started="$(date +%s)"
+    docker build \
+        --label "tester-env.project=${TESTER_ENV_PROJECT}" \
+        --label "tester-env.app=${TESTER_ENV_APP}" \
+        --label "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+        --build-arg CI_COMMIT_SHA="${CI_COMMIT_SHA:-dev}" \
+        -f "${SCRIPT_DIR}/Dockerfile.tester-env" \
+        -t "${IMAGE_NAME}" \
+        "${SCRIPT_DIR}"
+    echo "==> Build finished in $(( $(date +%s) - started ))s"
+
+    echo "==> Starting Postgres + Flagsmith (project ${PROJECT}, port ${PORT})..."
+    # No `--wait`: the image healthcheck starts before the first migration
+    # finishes, so the HTTP poll below is the real readiness gate.
+    compose up -d
+
+    echo "==> Waiting for the API and SPA..."
+    wait_http "http://localhost:${PORT}/config/project-overrides"
+
+    echo "==> Bootstrapping the platform-flags environment..."
+    compose cp "${SCRIPT_DIR}/tester-env-bootstrap.py" app:/tmp/tester-env-bootstrap.py
+    compose exec -T app python manage.py shell -c "exec(open('/tmp/tester-env-bootstrap.py').read())"
+
+    echo "==> Deployment complete."
+    echo "    App:      http://localhost:${PORT}  (browser containers: http://host.docker.internal:${PORT})"
+    echo "    Login:    ${E2E_USER} / ${E2E_PASSWORD} (after 'seed')"
+}
+
+cmd_seed() {
+    echo "==> Seeding deterministic e2e data via POST /api/v1/e2etests/teardown/ ..."
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+        -H "X-E2E-Test-Auth-Token: ${E2E_TEST_AUTH_TOKEN}" \
+        "http://localhost:${PORT}/api/v1/e2etests/teardown/")"
+    if [[ "${code}" != "204" ]]; then
+        echo "ERROR: teardown/seed returned HTTP ${code} (expected 204)."
+        exit 1
+    fi
+    echo "==> Applying the product baseline in 'My Test Project'..."
+    compose cp "${SCRIPT_DIR}/tester-env-seed.py" app:/tmp/tester-env-seed.py
+    compose exec -T app python manage.py shell -c \
+        "exec(open('/tmp/tester-env-seed.py').read())" \
+        || { echo "ERROR: product baseline seed failed."; exit 1; }
+    echo "==> Seed complete: organization 'Bullet Train Ltd', 7 projects, 8 users, enterprise plan,"
+    echo "    8 features, 4 tags, 2 segments and 3 identities in 'My Test Project'."
+}
+
+cmd_verify() {
+    echo "==> Verifying seeded state..."
+    local api="http://localhost:${PORT}/api/v1"
+    local login
+    login="$(curl -fs -X POST -H 'Content-Type: application/json' \
+        -d "{\"email\":\"${E2E_USER}\",\"password\":\"${E2E_PASSWORD}\"}" \
+        "${api}/auth/login/")" || { echo "ERROR: login failed for ${E2E_USER}."; exit 1; }
+    local token
+    token="$(printf '%s' "${login}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("key") or d.get("token") or "")')"
+    if [[ -z "${token}" ]]; then
+        echo "ERROR: login response carried no token."
+        exit 1
+    fi
+
+    curl -fs -H "Authorization: Token ${token}" "${api}/organisations/" \
+        | grep -q "Bullet Train Ltd" \
+        || { echo "ERROR: organization 'Bullet Train Ltd' missing."; exit 1; }
+
+    python3 - "${token}" "http://localhost:${PORT}" <<'PY'
+import json
+import sys
+import urllib.request
+
+token, base = sys.argv[1], sys.argv[2].rstrip("/")
+api = base + "/api/v1/"
+
+
+def get(path):
+    request = urllib.request.Request(
+        api + path, headers={"Authorization": f"Token {token}"}
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
+def fail(message):
+    print("ERROR: " + message)
+    sys.exit(1)
+
+
+DEV_FEATURES = {
+    "checkout_v2": (True, True, ["checkout", "experiment"]),
+    "seat_map_enabled": (True, True, ["checkout", "mobile"]),
+    "max_seats_per_booking": (True, 6, ["pricing"]),
+    "loyalty_points_multiplier": (True, 2, ["pricing", "experiment"]),
+    "checkout_copy_variant": (True, "one-tap", ["checkout", "experiment"]),
+    "journey_planner_config": (
+        True,
+        '{"max_connections": 2, "prefer_rail": true}',
+        ["mobile"],
+    ),
+    "delay_notification_threshold_minutes": (True, 10, ["mobile"]),
+    "duty_free_catalogue": (False, '{"enabled_categories": []}', []),
+}
+PROD_FEATURES = {
+    "checkout_v2": (False, True),
+    "seat_map_enabled": (True, True),
+    "max_seats_per_booking": (True, 4),
+    "loyalty_points_multiplier": (False, 1),
+    "checkout_copy_variant": (False, "control"),
+    "journey_planner_config": (
+        False,
+        '{"max_connections": 1, "prefer_rail": false}',
+    ),
+    "delay_notification_threshold_minutes": (True, 15),
+    "duty_free_catalogue": (False, '{"enabled_categories": []}'),
+}
+SEGMENTS = {
+    "Loyalty Members": [("plan", "EQUAL", "gold")],
+    "UK Frequent Travellers": [
+        ("country", "EQUAL", "GB"),
+        ("bookings", "GREATER_THAN_INCLUSIVE", "5"),
+    ],
+}
+TRAITS = {
+    "plan": "gold",
+    "country": "GB",
+    "bookings": 12,
+    "newsletter": True,
+}
+
+project = next((p for p in get("projects/") if p["name"] == "My Test Project"), None)
+if project is None:
+    fail("project 'My Test Project' missing from the seeded projects.")
+project_id = project["id"]
+
+tag_labels = {
+    t["id"]: t["label"] for t in get(f"projects/{project_id}/tags/")["results"]
+}
+if sorted(tag_labels.values()) != ["checkout", "experiment", "mobile", "pricing"]:
+    fail(f"project tags are {sorted(tag_labels.values())}.")
+
+environments = {
+    e["name"]: e for e in get(f"environments/?project={project_id}")["results"]
+}
+for name in ("Development", "Production"):
+    if name not in environments:
+        fail(f"environment '{name}' missing from 'My Test Project'.")
+
+
+def feature_map(environment):
+    return {
+        f["name"]: f
+        for f in get(
+            f"projects/{project_id}/features/"
+            f"?environment={environment['id']}&page_size=100"
+        )["results"]
+    }
+
+
+def check_states(environment, expected, with_tags):
+    actual = feature_map(environment)
+    if "browser_smoke_check" in actual:
+        fail("leftover feature 'browser_smoke_check' is still present.")
+    if set(actual) != set(expected):
+        fail(
+            f"{environment['name']} features are {sorted(actual)}, "
+            f"expected {sorted(expected)}."
+        )
+    for name, spec in expected.items():
+        state = actual[name]["environment_feature_state"]
+        if state["enabled"] != spec[0]:
+            fail(
+                f"{name} enabled={state['enabled']} in {environment['name']}, "
+                f"expected {spec[0]}."
+            )
+        if state["feature_state_value"] != spec[1]:
+            fail(
+                f"{name} value={state['feature_state_value']!r} in "
+                f"{environment['name']}, expected {spec[1]!r}."
+            )
+        if with_tags:
+            labels = sorted(tag_labels[t] for t in actual[name]["tags"])
+            if labels != sorted(spec[2]):
+                fail(f"{name} tags are {labels}, expected {sorted(spec[2])}.")
+
+
+check_states(environments["Development"], DEV_FEATURES, True)
+check_states(environments["Production"], PROD_FEATURES, False)
+
+segments = {
+    s["name"]: s for s in get(f"projects/{project_id}/segments/")["results"]
+}
+if set(segments) != set(SEGMENTS):
+    fail(f"segments are {sorted(segments)}, expected {sorted(SEGMENTS)}.")
+def leaf_conditions(rules):
+    for rule in rules:
+        for condition in rule["conditions"]:
+            yield (condition["property"], condition["operator"], condition["value"])
+        yield from leaf_conditions(rule.get("rules", []))
+
+
+for name, expected in SEGMENTS.items():
+    rules = segments[name]["rules"]
+    # The segment editor renders conditions from the root rule's nested rule
+    # groups (root ALL -> child ALL/ANY/NONE -> conditions); conditions on the
+    # root itself are invisible there.
+    if len(rules) != 1 or rules[0]["type"] != "ALL":
+        fail(f"segment {name} root rule is {rules}, expected one ALL rule.")
+    groups = rules[0].get("rules", [])
+    if not groups or any(g["type"] not in ("ALL", "ANY", "NONE") for g in groups):
+        fail(f"segment {name} has no AND/OR rule group: {rules[0]}.")
+    actual = list(leaf_conditions(rules))
+    if actual != expected:
+        fail(f"segment {name} conditions are {actual}, expected {expected}.")
+
+development_key = environments["Development"]["api_key"]
+identities = get(f"environments/{development_key}/identities/?page_size=100")["results"]
+if {i["identifier"] for i in identities} != {
+    "identity-1042",
+    "identity-2087",
+    "identity-3311",
+}:
+    fail(f"identities are {sorted(i['identifier'] for i in identities)}.")
+identity = next(i for i in identities if i["identifier"] == "identity-1042")
+trait_rows = get(
+    f"environments/{development_key}/identities/{identity['id']}/traits/"
+)["results"]
+traits = {
+    row["trait_key"]: {
+        "unicode": row["string_value"],
+        "int": row["integer_value"],
+        "bool": row["boolean_value"],
+    }[row["value_type"]]
+    for row in trait_rows
+}
+if traits != TRAITS:
+    fail(f"identity-1042 traits are {traits}, expected {TRAITS}.")
+
+print("==> Seed contents OK: 8 features (Development + Production states, tags),")
+print("    2 segments with rules and 3 identities with traits in 'My Test Project'.")
+PY
+
+    curl -fs "http://localhost:${PORT}/" | grep -q 'id="app"\|<div id=app' \
+        || echo "==> note: SPA root marker not matched in HTML; continuing"
+
+    local overrides
+    overrides="$(curl -fs "http://localhost:${PORT}/config/project-overrides")"
+    grep -q '"flagsmithClientAPI": *"/api/v1/"' <<<"${overrides}" \
+        || { echo "ERROR: SPA is not configured to read its flags from this instance."; exit 1; }
+    grep -q "edge.api.flagsmith.com" <<<"${overrides}" \
+        && { echo "ERROR: SPA still points at the public Flagsmith cloud."; exit 1; }
+
+    curl -fs -H "X-Environment-Key: ${FLAGSMITH_ON_FLAGSMITH_API_KEY}" \
+        "${api}/flags/" >/dev/null \
+        || { echo "ERROR: platform-flags SDK endpoint failed."; exit 1; }
+
+    echo "==> Verification complete: login, organisation, product baseline, SPA and SDK flag bootstrap OK."
+}
+
+cmd_reset() {
+    echo "==> Removing containers and the Postgres volume (image kept for reuse)..."
+    compose down -v --remove-orphans 2>/dev/null || true
+    echo "==> Reset complete."
+}
+
+cmd_stop() {
+    echo "==> Stopping containers (Postgres data preserved)..."
+    compose stop
+    echo "==> Stopped."
+}
+
+cmd_logs() {
+    compose logs -f "${1:-app}"
+}
+
+cmd_status() {
+    compose ps
+    if curl -fs "http://localhost:${PORT}/config/project-overrides" >/dev/null 2>&1; then
+        echo "Status: RUNNING at http://localhost:${PORT}"
+    else
+        echo "Status: NOT RESPONDING on http://localhost:${PORT}"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+Flagsmith - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build image from source, start Postgres + app, bootstrap SPA flags
+  seed      Reseed e2e data (org 'Bullet Train Ltd', 7 projects) plus the
+            product baseline in 'My Test Project'
+  verify    Assert login, org, project features/tags/segments/identities,
+            SPA and SDK flag bootstrap
+  reset     Remove containers + Postgres volume (clean slate, keeps image)
+  stop      Stop containers (Postgres data preserved)
+  logs      Tail app container logs
+  status    Show compose status and whether the app responds
+  help      Show this help message
+
+Options:
+  --run-id <id>     Isolate compose project/volume names for parallel runs.
+                    Default: \$RUN_ID or "default"
+  --port <port>     Host port for the app (container port 8000).
+                    Default: 18097
+
+Credentials: ${E2E_USER} / ${E2E_PASSWORD} (after 'seed')
+Env: FLAGSMITH_ON_FLAGSMITH_API_URL overrides where the SPA reads its own flags
+     (default "/api/v1/", i.e. this instance, so any page origin works).
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+
+    for ((i=2; i<=$#; i++)); do
+        local arg="${!i}"
+        case "${arg}" in
+            --run-id)
+                local next=$((i+1))
+                if [[ ${next} -le $# ]]; then
+                    RUN_ID="${!next}"
+                    ((i++))
+                else
+                    echo "Error: --run-id requires a value"
+                    exit 1
+                fi
+                ;;
+            --port)
+                local next=$((i+1))
+                if [[ ${next} -le $# ]]; then
+                    PORT="${!next}"
+                    ((i++))
+                else
+                    echo "Error: --port requires a value"
+                    exit 1
+                fi
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            *)
+                echo "Error: unknown argument '${arg}'"
+                cmd_help
+                exit 1
+                ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            echo "Error: unknown command '${cmd}'"
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
