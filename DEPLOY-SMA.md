@@ -205,6 +205,13 @@ state without `seed` (empty instance), and `reset` → `deploy` → `seed` →
 
 ## Caveats
 
+- The image carries upstream's `ENTERPRISE_VERSION` marker, exactly as
+  upstream's `private-cloud-*` targets do. Without it, self-hosted free-plan
+  subscription metadata pins `audit_log_visibility_days=0` and the audit-log API
+  filters out rows older than "now", so the project Audit Log always renders
+  "You have no log messages for your project." even though the rows exist. The
+  seeded organisation already has an 8-seat enterprise plan, so nothing else
+  changes for the seeded users.
 - First boot runs ~600 migrations and takes ~60 s before gunicorn listens; the
   image healthcheck's 20 s start period marks the container unhealthy in the
   meantime, so the CLI does not use `docker compose up --wait` and polls HTTP

@@ -73,4 +73,10 @@ FROM api-runtime AS oss-unified
 COPY --from=build-python /build/.venv/ /usr/local/
 COPY --from=build-node-django /build/api/ /app/
 RUN python manage.py collectstatic --no-input
+# Same marker upstream's private-cloud targets create: without it the
+# self-hosted free-plan metadata pins audit_log_visibility_days=0, and the
+# audit-log API filters rows older than now(), so the project audit log is
+# always empty (the e2e seed already sets an 8-seat enterprise plan, so this
+# only restores unlimited audit/feature-history visibility).
+RUN touch ./ENTERPRISE_VERSION
 USER nobody
